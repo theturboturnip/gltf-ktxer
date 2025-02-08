@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hash::Hash, marker::PhantomData, ops::Index, slice::SliceIndex, u64};
+use std::{collections::HashMap, hash::Hash, marker::PhantomData, ops::{Deref, Index}, slice::SliceIndex, u64};
 
 use crate::{Error, Result};
 
@@ -7,15 +7,33 @@ use serde_derive::{Deserialize, Serialize};
 
 pub type GltfDoc = serde_json::Map<String, serde_json::Value>;
 
-/// A wrapper for u64 that uses the maximum value as a sentinel for not-set.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+/// A wrapper for u64 that uses the maximum value as a sentinel for undefined.
+/// Defaults to undefined.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct GltfIndex<T>(usize, PhantomData<T>);
 impl<T> GltfIndex<T> {
+    pub const UNDEFINED: Self = Self(usize::MAX, PhantomData);
+
     pub fn of(x: usize) -> Self {
-        Self(x, PhantomData::default())
+        Self(x, PhantomData)
     }
-    pub fn exists(&self) -> bool {
-        self.0 != usize::MAX
+    pub fn is_undefined(&self) -> bool {
+        self.0 == usize::MAX
+    }
+    pub fn is_defined(&self) -> bool {
+        !self.is_undefined()
+    }
+    pub fn raw_idx(&self) -> usize {
+        self.0
+    }
+    pub fn idx_within(&self, list_name: &'static str, list_len: usize) -> Result<Option<usize>> {
+        if self.is_undefined() {
+            Ok(None)
+        } else if self.0 >= list_len {
+            Err(Error::IdxOOB { list_name, idx: self.0, num: list_len })
+        } else {
+            Ok(Some(self.0))
+        }
     }
 }
 impl<T> From<usize> for GltfIndex<T> {
@@ -28,18 +46,17 @@ impl<T> Default for GltfIndex<T> {
         GltfIndex::of(usize::MAX)
     }
 }
-impl<T> PartialEq for GltfIndex<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl<T> Eq for GltfIndex<T> {}
 impl<T> Hash for GltfIndex<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
-
+impl<T> Clone for GltfIndex<T> {
+    fn clone(&self) -> Self {
+        Self::of(self.0.clone())
+    }
+}
+impl<T> Copy for GltfIndex<T> {}
 
 pub trait GltfList<T> : std::ops::Index<usize, Output = T> + Sized {
     fn gltf_index(&self, idx: GltfIndex<T>, list_name: &'static str) -> Result<Option<&T>>;
@@ -52,21 +69,16 @@ pub trait GltfList<T> : std::ops::Index<usize, Output = T> + Sized {
 }
 impl<T> GltfList<T> for Vec<T> {
     fn gltf_index(&self, idx: GltfIndex<T>, list_name: &'static str) -> Result<Option<&T>> {
-        if idx.0 == usize::MAX {
-            Ok(None)
-        } else if idx.0 > self.len() {
-            Err(Error::IdxOOB { list_name, idx: idx.0, num: self.len() })
-        } else {
-            Ok(Some(&self[idx.0]))
-        }
+        let idx = idx.idx_within(list_name, self.len())?;
+        Ok(idx.map(|idx| &self[idx]))
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct GltfUri(String);
 
 /// A buffer points to binary geometry, animation, or skins.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct GltfBuffer {
     /// The URI (or IRI) of the buffer.
     /// Relative paths are relative to the current glTF asset.
@@ -81,8 +93,39 @@ pub struct GltfBuffer {
     pub extras: serde_json::Value,
 }
 
+impl GltfBuffer {
+    pub fn dump_data<'a>(&self, idx: usize, map: &'a HashMap<Option<String>, Vec<u8>>) -> Result<U8VecOrSlice<'a>> {
+        match &self.uri {
+            None if idx == 0 => match map.get(&None) {
+                Some(data) => U8VecOrSlice::of_sliced_vec(data, self.byte_length),
+                None => Err(Error::BufferUriMissingData(None))
+            }
+            None => Err(Error::BufferHadNoUri(idx)),
+            Some(uri) => {
+                if let Some(data) = base64str_from_data_uri(uri.0.as_str()) {
+                    // RFC 2397 for data URIs contains an example in section 4
+                    // which uses the '/' character. While the base64 crate does have a URL-safe alphabet which avoids + and /, 
+                    // we can assume we don't need to use it.
+                    U8VecOrSlice::of_owned_vec(BASE64_STANDARD.decode(data)?, self.byte_length)
+                } else {
+                    match map.get(&Some(uri.0.clone())) {
+                        Some(data) => U8VecOrSlice::of_sliced_vec(data, self.byte_length),
+                        None => Err(Error::BufferUriMissingData(Some(uri.0.clone())))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a> From<GltfIndex<GltfBuffer>> for GltfIndex<U8VecOrSlice<'a>> {
+    fn from(value: GltfIndex<GltfBuffer>) -> Self {
+        GltfIndex::of(value.0)
+    }
+}
+
 /// A view into a buffer generally representing a subset of the buffer.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct GltfBufferView {
     /// The index of the buffer.
     pub buffer: GltfIndex<GltfBuffer>,
@@ -104,25 +147,37 @@ pub struct GltfBufferView {
     pub extras: serde_json::Value,
 }
 
-#[derive(Debug)]
+impl GltfBufferView {
+    pub fn slice_from<'a>(&self, buffer_datas: &'a Vec<U8VecOrSlice<'a>>) -> Result<&'a [u8]> {
+        let buffer = buffer_datas.gltf_index_required(self.buffer.into(), "buffers")?;
+        if self.byte_offset + self.byte_length > buffer.len() {
+            Err(Error::BufferViewSizeOOB { buffer_len: buffer.len(), buffer_view_off: self.byte_offset, buffer_view_len: self.byte_length })
+        } else {
+            let data = &buffer[self.byte_offset..(self.byte_offset+self.byte_length)];
+            Ok(data)
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct GltfSampler();
 
 /// A texture and its sampler.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct GltfTexture {
     /// The index of the sampler used by this texture.
     /// When undefined, a sampler with repeat wrapping and auto filtering **SHOULD** be used.
-    pub sampler: Option<GltfIndex<GltfSampler>>,
+    pub sampler: GltfIndex<GltfSampler>,
     /// The index of the image used by this texture.
     /// When undefined, an extension or other mechanism **SHOULD** supply an alternate texture source, otherwise behavior is undefined.
-    pub source: Option<GltfIndex<GltfImage>>,
+    pub source: GltfIndex<GltfImage>,
     pub name: serde_json::Value,
     pub extensions: serde_json::Value,
     pub extras: serde_json::Value,
 }
 
 /// Image data used to create a texture. Image **MAY** be referenced by an URI (or IRI) or a buffer view index.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct GltfImage {
     /// The URI (or IRI) of the image.
     /// Relative paths are relative to the current glTF asset.
@@ -140,6 +195,32 @@ pub struct GltfImage {
     pub name: serde_json::Value,
     pub extensions: serde_json::Value,
     pub extras: serde_json::Value,
+}
+impl GltfImage {
+    pub fn dump_data<'a>(&self, buffer_views: &'a Vec<GltfBufferView>, buffer_datas: &'a Vec<U8VecOrSlice<'a>>, map: &'a HashMap<Option<String>, Vec<u8>>) -> Result<U8VecOrSlice<'a>> {
+        match (&self.uri, self.buffer_view) {
+            (Some(uri), GltfIndex::UNDEFINED) => {
+                if let Some(data) = base64str_from_data_uri(uri.0.as_str()) {
+                    // RFC 2397 for data URIs contains an example in section 4
+                    // which uses the '/' character. While the base64 crate does have a URL-safe alphabet which avoids + and /, 
+                    // we can assume we don't need to use it.
+                    let data = BASE64_STANDARD.decode(data)?;
+                    let data_len = data.len();
+                    U8VecOrSlice::of_owned_vec(data, data_len)
+                } else {
+                    match map.get(&Some(uri.0.clone())) {
+                        Some(data) => U8VecOrSlice::of_sliced_vec(data, data.len()),
+                        None => Err(Error::BufferUriMissingData(Some(uri.0.clone())))
+                    }
+                }
+            }
+            (None, buffer_view_idx) if buffer_view_idx.is_defined() => {
+                let view = buffer_views.gltf_index_required(buffer_view_idx, "bufferViews")?;
+                view.slice_from(buffer_datas).map(|slice| U8VecOrSlice::S(slice))
+            }
+            _ => Err(Error::ImageNeedsDataUriXorBufferView { uri: self.uri.clone().map(|u| u.0), buffer_view: self.buffer_view })
+        }
+    }
 }
 
 pub enum U8VecOrSlice<'a> {
@@ -179,6 +260,16 @@ impl<'a, I: SliceIndex<[u8]>> Index<I> for U8VecOrSlice<'a> {
         match self {
             U8VecOrSlice::V(items) => &items[index],
             U8VecOrSlice::S(items) => &items[index],
+        }
+    }
+}
+impl<'a> Deref for U8VecOrSlice<'a> {
+    type Target = [u8];
+    
+    fn deref(&self) -> &Self::Target {
+        match self {
+            U8VecOrSlice::V(items) => items.as_slice(),
+            U8VecOrSlice::S(items) => items,
         }
     }
 }
@@ -230,27 +321,4 @@ fn base64str_from_data_uri(uri: &str) -> Option<&str> {
     };
     // optionally has ";base64", always has comma
     uri.strip_prefix(";base64,").or_else(|| uri.strip_prefix(","))
-}
-
-pub fn dump_data<'a>(uri: &Option<GltfUri>, idx: usize, map: &'a HashMap<Option<String>, Vec<u8>>, byte_length: usize) -> Result<U8VecOrSlice<'a>> {
-    match uri {
-        None if idx == 0 => match map.get(&None) {
-            Some(data) => U8VecOrSlice::of_sliced_vec(data, byte_length),
-            None => Err(Error::BufferUriMissingData(None))
-        }
-        None => Err(Error::BufferHadNoUri(idx)),
-        Some(uri) => {
-            if let Some(data) = base64str_from_data_uri(uri.0.as_str()) {
-                // RFC 2397 for data URIs contains an example in section 4
-                // which uses the '/' character. While the base64 crate does have a URL-safe alphabet which avoids + and /, 
-                // we can assume we don't need to use it.
-                U8VecOrSlice::of_owned_vec(BASE64_STANDARD.decode(data)?, byte_length)
-            } else {
-                match map.get(&Some(uri.0.clone())) {
-                    Some(data) => U8VecOrSlice::of_sliced_vec(data, byte_length),
-                    None => Err(Error::BufferUriMissingData(Some(uri.0.clone())))
-                }
-            }
-        }
-    }
 }

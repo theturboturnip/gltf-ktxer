@@ -1,12 +1,13 @@
 use std::{collections::{HashMap, HashSet}, num::NonZeroU8};
 
-use gltf::{dump_data, GltfBuffer, GltfBufferView, GltfDoc, GltfImage, GltfIndex, GltfList, GltfTexture, U8VecOrSlice};
+use gltf::{GltfBuffer, GltfBufferView, GltfDoc, GltfImage, GltfIndex, GltfList, GltfTexture, U8VecOrSlice};
 // use libktx_rs::{sources::{CommonCreateInfo, Ktx2CreateInfo}, sys::ktxStream, TextureSource};
 
 mod gltf;
 mod error;
 use error::{Error, Result};
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::json;
 use thiserror::Error;
 
 struct Input<'a> {
@@ -18,6 +19,24 @@ impl<'a> Input<'a> {
         match self.gltf_json.get(name) {
             None => Ok(vec![]),
             Some(value) => Ok(serde_json::from_value(value.clone())?)
+        }
+    }
+    fn get_gltf_index<T: DeserializeOwned>(&self, idx: GltfIndex<T>, list_name: &'static str) -> Result<Option<T>> {
+        match self.gltf_json.get(list_name).and_then(|val| val.as_array()) {
+            Some(array) => match idx.idx_within(list_name, array.len())? {
+                Some(idx) => {
+                    let value = &array[idx];
+                    Ok(Some(serde_json::from_value(value.clone())?))
+                }
+                None => Ok(None)
+            }
+            _ => Ok(None) // TODO this will end up producing IdxNotSet which is the wrong kind of erroor...
+        }
+    }
+    fn get_gltf_index_required<T: DeserializeOwned>(&self, idx: GltfIndex<T>, list_name: &'static str) -> Result<T> {
+        match self.get_gltf_index(idx, list_name)? {
+            None => Err(Error::IdxNotSet { list_name }),
+            Some(data) => Ok(data),
         }
     }
     fn set_list<T: Serialize>(&mut self, name: &str, data: Vec<T>) -> Result<()> {
@@ -43,17 +62,12 @@ fn pack_buffers_together(mut input: Input<'_>) -> Result<Output> {
     let buffer_datas: Vec<U8VecOrSlice<'_>> = buffers
         .into_iter()
         .enumerate()
-        .map(|(idx, b)| dump_data(&b.uri, idx, input.binaries, b.byte_length))
+        .map(|(idx, b)| b.dump_data(idx, input.binaries))
         .collect::<Result<_>>()?;
     let (new_buffer_views, new_buffer) = pack_buffer_views(
         buffer_views.into_iter().map(|v| {
-            let buffer = buffer_datas.gltf_index_required(v.buffer, "buffers")?;
-            if v.byte_offset + v.byte_length > buffer.len() {
-                Err(Error::BufferViewSizeOOB { buffer_len: buffer.len(), buffer_view_off: v.byte_offset, buffer_view_len: v.byte_length })
-            } else {
-                let data = &buffer[v.byte_offset..(v.byte_offset+v.byte_length)];
-                Ok((v, data))
-            }
+            let slice = v.slice_from(&buffer_datas)?;
+            Ok((v, slice))
         })
     )?;
 
@@ -93,8 +107,10 @@ fn pack_buffer_views<'a, I>(iter: I) -> Result<(Vec<GltfBufferView>, Vec<u8>)>
                 // always be a multiple of the size of the accessor's component type.
                 // the maximum component type size is 4 (32 bits, as seen in 3.6.2.2 Accessor Data Types).
                 // therefore always pad out to 4-bytes to be sure we're always aligned.
-                new_buffer.extend_from_slice(&[0xFF; 4 - data.len() % 4]);
-                assert!(data.len() % 4 == 0);
+                if new_buffer.len() % 4 != 0 {
+                    new_buffer.resize(new_buffer.len() + (4 - (new_buffer.len() % 4)), 0);
+                }
+                assert!(new_buffer.len() % 4 == 0);
             }
             Err(e) => return Err(e)
         } 
@@ -114,8 +130,8 @@ fn pack_buffer_views<'a, I>(iter: I) -> Result<(Vec<GltfBufferView>, Vec<u8>)>
 //     export_as_srgb: bool,
 // }
 
-fn texture_ktx_source(image: &GltfTexture) -> Option<GltfIndex<GltfImage>> {
-    image
+fn texture_ktx_source(texture: &GltfTexture) -> Option<GltfIndex<GltfImage>> {
+    texture
         .extensions
         .as_object()?
         .get("KHR_texture_basisu")?
@@ -123,6 +139,24 @@ fn texture_ktx_source(image: &GltfTexture) -> Option<GltfIndex<GltfImage>> {
         .get("source")?
         .as_u64()
         .map(|idx| GltfIndex::of(idx as usize))
+}
+fn set_texture_ktx_source(texture: &mut GltfTexture, new_idx: GltfIndex<GltfImage>) -> Result<()> {
+    assert!(new_idx.is_defined());
+
+    let ext = match &mut texture.extensions {
+        serde_json::Value::Object(obj) => obj,
+        serde_json::Value::Null => {
+            texture.extensions = serde_json::Value::Object(serde_json::Map::new());
+            texture.extensions.as_object_mut().unwrap()
+        }
+        _ => return Err(Error::TextureHasInvalidExtensions)
+    };
+    
+    ext["KHR_texture_basisu"] = json!({
+        "source": (new_idx.raw_idx())
+    });
+
+    Ok(())
 }
 
 fn material_diffuse_tex(mat: &serde_json::Value) -> Option<GltfIndex<GltfTexture>> {
@@ -176,14 +210,14 @@ enum ImageReencodeFormat {
 }
 
 struct Params {
-    uncompressed_format: Option<image::ImageFormat>,
+    uncompressed_format: image::ImageFormat,
     ktx_basis_compression_quality: Option<NonZeroU8>,
     ktx_transcode_to_bc1_or_bc3: bool,
 }
 impl Default for Params {
     fn default() -> Self {
         Self {
-            uncompressed_format: Some(image::ImageFormat::Jpeg),
+            uncompressed_format: image::ImageFormat::Jpeg,
             ktx_basis_compression_quality: None,
             ktx_transcode_to_bc1_or_bc3: true,
         }
@@ -192,7 +226,7 @@ impl Default for Params {
 
 struct ImageReencodeJob {
     data: Vec<u8>,
-    data_mime_type: Vec<u8>,
+    data_mime_type: String,
     data_used_as_srgb: bool,
     reencode_as: ImageReencodeFormat,
     preexisting_buffer_view_idx: GltfIndex<GltfBufferView>,
@@ -201,18 +235,25 @@ struct ImageReencodeJob {
 fn get_reencode_jobs(input: Input, params: Params) -> Result<ReencodeJobs> {
     let mut textures: Vec<GltfTexture> = input.get_list("textures")?;
     let images: Vec<GltfImage> = input.get_list("images")?;
+    let buffer_views: Vec<GltfBufferView> = input.get_list("bufferViews")?;
+    let buffers: Vec<GltfBuffer> = input.get_list("buffers")?;
+    let buffer_datas: Vec<U8VecOrSlice<'_>> = buffers
+        .into_iter()
+        .enumerate()
+        .map(|(idx, b)| b.dump_data(idx, input.binaries))
+        .collect::<Result<_>>()?;
     let srgb_texture_indices = get_srgb_texture_indices(&input);
     
     let mut new_images = vec![];
     let mut old_image_idx_to_new_image_idx = HashMap::new();
-    let lookup_old_img = |old_img_idx: GltfIndex<GltfImage>, srgb: bool, reencode_as: ImageReencodeFormat| -> Result<GltfIndex<GltfImage>> {
+    let lookup_old_img = |old_img_idx: GltfIndex<GltfImage>, srgb: bool, initial_data: Vec<u8>, initial_data_mime_type: String, reencode_as: ImageReencodeFormat| -> Result<GltfIndex<GltfImage>> {
         if let Some(new_img_idx) = old_image_idx_to_new_image_idx.get(&old_img_idx) {
             Ok(*new_img_idx)
         } else {
             let new_img_idx = GltfIndex::of(new_images.len());
             new_images.push(ImageReencodeJob {
-                data: todo!(),
-                data_mime_type: todo!(),
+                data: initial_data,
+                data_mime_type: initial_data_mime_type,
                 data_used_as_srgb: srgb,
                 reencode_as,
                 preexisting_buffer_view_idx: images.gltf_index_required(old_img_idx, "images")?.buffer_view,
@@ -223,14 +264,60 @@ fn get_reencode_jobs(input: Input, params: Params) -> Result<ReencodeJobs> {
     };
 
     for (tex_idx, tex) in textures.iter().enumerate() {
-        let data_used_as_srgb = srgb_texture_indices.contains(GltfIndex::of(tex_idx));
+        let data_used_as_srgb = srgb_texture_indices.contains(&GltfIndex::of(tex_idx));
         let unoptimized_img = tex.source;
-        let optimized_img = texture_ktx_source(tex);
+        let optimized_img = 
+            texture_ktx_source(tex).unwrap_or(GltfIndex::UNDEFINED);
 
-        let mut new_texture = tex.clone();
-        // TODO extract source data from unoptimized_img or optimized_img
-        // TODO make new images for each of (unoptimized) and (optimized) new images, potentially reusing the buffer views from the old ones
+        let mut img_src = None;
+        if let Some(img) = input.get_gltf_index(unoptimized_img, "images")? {
+            let data = img.dump_data(&buffer_views, &buffer_datas, input.binaries)?;
+            let mime_type = match img.mime_type {
+                Some(mime_type) => mime_type,
+                None => image::guess_format(&data)?.to_mime_type().to_string()
+            };
+            img_src = Some((data, mime_type))
+        } else if let Some(img) = input.get_gltf_index(optimized_img, "images")? {
+            let data = img.dump_data(&buffer_views, &buffer_datas, input.binaries)?;
+            if (&data).starts_with(&[
+                0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
+            ]) {
+                img_src = Some((data, "image/ktx2".to_string()))
+            } else {
+                return Err(Error::ImageClaimedKtx2ButWasNot)
+            }
+        }
+
+        if let Some((initial_data, initial_data_mime_type)) = img_src {
+            tex.source = lookup_old_img(
+                unoptimized_img,
+                data_used_as_srgb,
+                initial_data.to_vec(),
+                initial_data_mime_type,
+                ImageReencodeFormat::Basic(params.uncompressed_format),
+            )?;
+            set_texture_ktx_source(
+                &mut tex, 
+                lookup_old_img(
+                    optimized_img,
+                    data_used_as_srgb,
+                    initial_data.to_vec(),
+                    initial_data_mime_type,
+                ImageReencodeFormat::Ktx {
+                        basis_compression_quality: params.ktx_basis_compression_quality,
+                        transcoded_to_bc1_or_bc3: params.ktx_transcode_to_bc1_or_bc3,
+                    },
+                )?,
+            )?;
+        } else {
+            return Err(Error::ImageHasNoSources)
+        }
     }
+
+    Ok(ReencodeJobs {
+        new_textures: textures, // modified in place
+        new_images,
+    })
 }
 
 /*
